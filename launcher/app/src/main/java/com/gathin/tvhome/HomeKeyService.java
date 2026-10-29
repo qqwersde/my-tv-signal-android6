@@ -2,6 +2,8 @@ package com.gathin.tvhome;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.app.AppOpsManager;
+import android.app.KeyguardManager;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
@@ -13,6 +15,8 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
 import android.os.UserManager;
 import android.content.pm.PackageManager;
@@ -69,9 +73,11 @@ public class HomeKeyService extends AccessibilityService {
     private boolean foregroundPollStarted;
     private boolean foregroundPollStopped;
     private int foregroundTicks;
-    private long foregroundTakenAt = Long.MIN_VALUE / 2;
+    private final HomeForeground foreground = new HomeForeground();
+    private long usageCursor;
+    private boolean usageActive;
+    private BroadcastReceiver screenReceiver;
     private static final long FOREGROUND_POLL_MS = 1000;
-    private static final long FOREGROUND_LOOKBACK_MS = 10_000;
 
     @Override
     protected void onServiceConnected() {
@@ -118,6 +124,10 @@ public class HomeKeyService extends AccessibilityService {
         stopWaitingForUnlock();
         foregroundPollStopped = true;
         handler.removeCallbacks(foregroundCheck);
+        if (screenReceiver != null) {
+            unregisterReceiver(screenReceiver);
+            screenReceiver = null;
+        }
         if (gamepads != null) gamepads.stop();
         if (consumeVolumeKeys) VolumeKeys.stop();
         super.onDestroy();
@@ -152,11 +162,21 @@ public class HomeKeyService extends AccessibilityService {
             info.eventTypes |= AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
             setServiceInfo(info);
         }
-        if (!stockHome.isEmpty()) probeAtBoot();
+        // On Android 6, opening a probe can interrupt playback before we know what is in front.
+        if (Build.VERSION.SDK_INT >= 24 && !stockHome.isEmpty()) probeAtBoot();
         // MiTV4-ANSM0 (Android 6): the stock home comes up without an accessibility window event.
         // Usage stats still name the activity in front. Without the permission the poll stops itself.
         if (Build.VERSION.SDK_INT <= 23 && !foregroundPollStarted) {
             foregroundPollStarted = true;
+            usageCursor = System.currentTimeMillis();
+            screenReceiver = new BroadcastReceiver() {
+                @Override public void onReceive(Context context, Intent intent) {
+                    resetUsage(System.currentTimeMillis());
+                }
+            };
+            IntentFilter screen = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+            screen.addAction(Intent.ACTION_SCREEN_ON);
+            registerReceiver(screenReceiver, screen);
             handler.postDelayed(foregroundCheck, FOREGROUND_POLL_MS);
         }
         holdAppKeys = RemoteKeys.parseHoldAppKeys(config.appKeys);
@@ -221,6 +241,15 @@ public class HomeKeyService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
+        if (Build.VERSION.SDK_INT <= 23) {
+            // On this generation only a fresh, stable usage event may trigger a redirect.
+            // Any other window invalidates pending evidence, including vendor input screens.
+            if (!HomeForeground.matches(stockHomePackage, stockHome,
+                    event.getPackageName(), event.getClassName())) {
+                resetUsage(System.currentTimeMillis());
+            }
+            return;
+        }
         CharSequence cls = event.getClassName();
         if (cls == null) return;
         String name = cls.toString();
@@ -260,7 +289,7 @@ public class HomeKeyService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    /** One look per second at which activity moved to the front. Stops after a missing permission. */
+    /** One look per second at complete foreground/background transitions on Android 6. */
     private final Runnable foregroundCheck = new Runnable() {
         @Override
         public void run() {
@@ -268,12 +297,11 @@ public class HomeKeyService extends AccessibilityService {
             handler.postDelayed(this, FOREGROUND_POLL_MS);
             foregroundTicks++;
             if (stockHome.isEmpty() || foregroundTicks % 30 == 1) refreshStockHomes();
-            if (stockHome.isEmpty()) return;
-            long[] at = new long[1];
-            String cls = newestForeground(at);
-            if (cls == null || at[0] <= foregroundTakenAt || !stockHome.contains(cls)) return;
-            foregroundTakenAt = at[0];
-            openHome();
+            if (stockHome.isEmpty()) {
+                resetUsage(System.currentTimeMillis());
+                return;
+            }
+            checkForeground();
         }
     };
 
@@ -287,29 +315,51 @@ public class HomeKeyService extends AccessibilityService {
         }
     }
 
-    /** Class name of the newest move to the front in the last few seconds, or null. */
-    private String newestForeground(long[] atOut) {
+    private void resetUsage(long now) {
+        foreground.clear();
+        usageCursor = now;
+        usageActive = false;
+    }
+
+    private void checkForeground() {
+        long now = System.currentTimeMillis();
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        KeyguardManager keyguard = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        AppOpsManager ops = (AppOpsManager) getSystemService(APP_OPS_SERVICE);
         UsageStatsManager stats = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
-        if (stats == null) return null;
+        boolean active = power != null && power.isInteractive() && keyguard != null
+                && !keyguard.isKeyguardLocked() && ops != null && stats != null
+                && ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS,
+                        Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
+        if (!active || now < usageCursor) {
+            resetUsage(now);
+            return;
+        }
+        if (!usageActive) {
+            // Do not replay events from before a permission, lock or screen transition.
+            usageCursor = now;
+            usageActive = true;
+            return;
+        }
         try {
-            long now = System.currentTimeMillis();
-            UsageEvents events = stats.queryEvents(now - FOREGROUND_LOOKBACK_MS, now);
-            if (events == null) return null;
+            UsageEvents events = stats.queryEvents(usageCursor, now);
+            if (events == null) {
+                resetUsage(now);
+                return;
+            }
             UsageEvents.Event event = new UsageEvents.Event();
-            String cls = null;
-            long at = 0;
             while (events.hasNextEvent()) {
                 events.getNextEvent(event);
-                if (event.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND && event.getClassName() != null) {
-                    cls = event.getClassName();
-                    at = event.getTimeStamp();
+                if (event.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                    foreground.foreground(event.getPackageName(), event.getClassName(), event.getTimeStamp());
+                } else if (event.getEventType() == UsageEvents.Event.MOVE_TO_BACKGROUND) {
+                    foreground.background(event.getPackageName(), event.getClassName());
                 }
             }
-            atOut[0] = at;
-            return cls;
+            usageCursor = now;
+            if (foreground.takeHome(stockHomePackage, stockHome, now)) openHome();
         } catch (SecurityException denied) {
-            foregroundPollStopped = true;
-            return null;
+            resetUsage(now);
         }
     }
 
